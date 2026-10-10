@@ -9,7 +9,7 @@ Nejlevnejsi produkcni start:
 Finalni URL bez domeny bude vypadat takhle:
 
 ```text
-https://pokornydavid.github.io/fit-plan-local/
+https://dpokornydev.github.io/fit-plan-local/
 ```
 
 ## 1. Supabase
@@ -44,19 +44,19 @@ V Supabase otevri Authentication > URL Configuration.
 Site URL:
 
 ```text
-https://pokornydavid.github.io/fit-plan-local/
+https://dpokornydev.github.io/fit-plan-local/
 ```
 
 Redirect URLs:
 
 ```text
 http://localhost:4173/
-https://pokornydavid.github.io/fit-plan-local/
+https://dpokornydev.github.io/fit-plan-local/
 ```
 
 ## 3. GitHub Pages
 
-1. Otevri repo `https://github.com/pokornydavid/fit-plan-local`.
+1. Otevri repo `https://github.com/dpokornydev/fit-plan-local`.
 2. Settings > Pages.
 3. Build and deployment:
    - Source: Deploy from a branch
@@ -64,7 +64,7 @@ https://pokornydavid.github.io/fit-plan-local/
    - Folder: `/root`
 4. Klikni Save.
 5. Pockej minutu.
-6. Otevri `https://pokornydavid.github.io/fit-plan-local/`.
+6. Otevri `https://dpokornydev.github.io/fit-plan-local/`.
 
 ## 4. Mobil
 

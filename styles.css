@@ -4056,6 +4056,19 @@ summary:focus-visible {
   box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.12);
 }
 
+.account-status.offline span {
+  background: var(--muted);
+}
+
+.account-status strong {
+  font-weight: inherit;
+}
+
+.profile-sync-card .btn {
+  width: 100%;
+  margin-top: 10px;
+}
+
 .account-action {
   width: 100%;
   min-height: 38px;

@@ -20,6 +20,16 @@ http://localhost:4173
 
 Data se ukladaji do `localStorage` v prohlizeci. V appce je i export/import JSON.
 
+Aktuální online adresa: https://dpokornydev.github.io/fit-plan-local/
+
+Při přihlášení se celá historie tréninků, výživy, regenerace, progresu a knihovna
+cviků synchronizují přes Supabase. Na všech zařízeních použij stejný účet.
+Profil ukazuje skutečný stav zápisů a nabízí „Synchronizovat teď“, export a import
+zálohy. Import sloučí celou historii; čekající zápisy zůstanou na zařízení i při
+výpadku spojení. Starou uloženou kopii z původní adresy před přechodem zálohuj.
+
+Regresní testy synchronizace: `npm test`.
+
 ## Supabase cloud
 
 1. Vytvor Supabase projekt.

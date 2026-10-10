@@ -3,7 +3,7 @@ const PENDING_SYNC_KEY = "fit-plan-pending-sync-v1";
 const USER_STORAGE_PREFIX = `${STORAGE_KEY}:user:`;
 const USER_PENDING_SYNC_PREFIX = `${PENDING_SYNC_KEY}:user:`;
 const COPY_BACKUP_PREFIX = `${STORAGE_KEY}:copy-backup:`;
-const APP_VERSION = "96";
+const APP_VERSION = "98";
 const SUPABASE_CONFIG_URL = `./supabase-config.js?v=${APP_VERSION}`;
 const SUPABASE_LOCAL_UMD_URL = `./assets/supabase.min.js?v=${APP_VERSION}`;
 const SUPABASE_MODULE_URL = "https://esm.sh/@supabase/supabase-js@2.45.4";
@@ -11,6 +11,7 @@ const SUPABASE_FALLBACK_MODULE_URL = "https://cdn.jsdelivr.net/npm/@supabase/sup
 const SUPABASE_UMD_URL = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js";
 const CLOUD_INIT_TIMEOUT_MS = 25000;
 const CLOUD_REFRESH_INTERVAL_MS = 6000;
+const CLOUD_REQUEST_TIMEOUT_MS = 20000;
 const PRODUCT_NAME = "Become Better";
 const PRODUCT_TAGLINE = "Performance and recovery tracker";
 const PRODUCT_EYEBROW = "Become Better by David";
@@ -328,6 +329,15 @@ const UI_TRANSLATION_ENTRIES = [
   ["Světlý vzhled", "Light appearance"],
   ["Tmavý vzhled", "Dark appearance"],
   ["Cloud synchronizován", "Cloud synced"],
+  ["Synchronizace se nepovedla", "Sync failed"],
+  ["Čeká na synchronizaci", "Waiting to sync"],
+  ["Synchronizuji…", "Syncing…"],
+  ["Synchronizovat teď", "Sync now"],
+  ["Synchronizace mezi zařízeními", "Sync across devices"],
+  ["Záloha dat do souboru", "Export backup"],
+  ["Importovat zálohu", "Import backup"],
+  ["Ověřuji data uložená v cloudu.", "Checking the data saved in the cloud."],
+  ["Na počítači i mobilu používej stejnou adresu aplikace a stejný e-mail. Tréninky, výživa, regenerace a progres se ukládají k tvému účtu.", "Use the same app address and email on your computer and phone. Training, nutrition, recovery and progress are saved to your account."],
   ["Lokální režim", "Local mode"],
   ["Identita", "Identity"],
   ["Jméno se ukazuje v aplikaci a ve sdílených přehledech.", "Name is shown in the app and shared overviews."],
@@ -398,6 +408,7 @@ let activeStorageKey = STORAGE_KEY;
 let activePendingSyncKey = PENDING_SYNC_KEY;
 let activeUserId = null;
 let state = loadState();
+let savedLibraryFingerprint = JSON.stringify(state.library);
 let authScreenMode = "sign-in";
 let authBusy = false;
 let authBusyMode = "sign-in";
@@ -412,6 +423,11 @@ let exerciseDrag = null;
 let phasePhotoDrag = null;
 let pendingSync = loadPendingSync();
 let flushingPendingSync = false;
+let pendingSyncPromise = null;
+let signedInSessionPromise = null;
+let signedInSessionUserId = null;
+let authChangeTimer = 0;
+let authSubscription = null;
 let feedLoadSeq = 0;
 let pendingPhasePhotoRowId = null;
 let phasePhotoViewer = null;
@@ -448,7 +464,11 @@ let cloud = {
   passwordRecovery: false,
   status: "local",
   message: "Supabase neni pripojeny. Appka zatim uklada lokalne.",
-  loading: false
+  loading: false,
+  syncError: "",
+  lastSyncedAt: "",
+  hasLoaded: false,
+  historyLoaded: false
 };
 
 const app = document.querySelector("#app");
@@ -591,8 +611,7 @@ async function boot() {
   render();
   await initSupabase();
   if (cloud.session) {
-    await loadCloudData();
-    await flushPendingSync();
+    await finishSignedInSession(cloud.session);
     if (state.activeView === "dashboard") {
       await loadYearConsistencyData(getSelectedDate().getFullYear());
     }
@@ -612,7 +631,10 @@ async function initSupabase() {
     }
 
     const { createClient } = await importSupabaseClient();
-    cloud.client = createClient(config.SUPABASE_URL, config.SUPABASE_ANON_KEY);
+    authSubscription?.unsubscribe();
+    cloud.client = createClient(config.SUPABASE_URL, config.SUPABASE_ANON_KEY, {
+      global: { fetch: fetchCloudRequest }
+    });
     cloud.configured = true;
     cloud.status = "auth";
     cloud.message = "Supabase je pripraveny.";
@@ -641,28 +663,7 @@ async function initSupabase() {
       }
     }
 
-    cloud.client.auth.onAuthStateChange(async (event, session) => {
-      cloud.session = session;
-      if (event === "PASSWORD_RECOVERY") cloud.passwordRecovery = true;
-      if (session) {
-        activateUserStorage(session.user.id);
-        if (!cloud.passwordRecovery) {
-          cloud.authNotice = null;
-          cloud.pendingEmail = "";
-        }
-        try {
-          await ensureProfile();
-        } catch (profileError) {
-          console.warn(profileError);
-        }
-        if (!cloud.passwordRecovery) {
-          await finishSignedInSession(session, "Jsi prihlaseny.");
-        }
-      } else {
-        finishSignedOutState();
-      }
-      render();
-    });
+    authSubscription = cloud.client.auth.onAuthStateChange(handleAuthStateChange).data.subscription;
   } catch (error) {
     cloud.configured = false;
     cloud.client = null;
@@ -672,6 +673,49 @@ async function initSupabase() {
     console.warn(error);
   } finally {
     cloud.ready = true;
+  }
+}
+
+// Supabase holds its auth lock while notifying listeners. Network work must
+// start in a later task, after this synchronous callback has returned.
+function handleAuthStateChange(event, session) {
+  const previousUserId = activeUserId;
+  cloud.session = session;
+  clearTimeout(authChangeTimer);
+  if (event === "PASSWORD_RECOVERY") {
+    cloud.passwordRecovery = true;
+    if (session) activateUserStorage(session.user.id);
+    render();
+    return;
+  }
+  if (!session) {
+    finishSignedOutState();
+    render();
+    return;
+  }
+  activateUserStorage(session.user.id);
+  if (event === "INITIAL_SESSION" && previousUserId === session.user.id) return;
+  authChangeTimer = setTimeout(() => {
+    if (cloud.session?.user.id !== session.user.id || cloud.passwordRecovery) return;
+    const work = previousUserId !== session.user.id
+      ? finishSignedInSession(session)
+      : refreshCloudDataIfIdle({ force: true });
+    work.catch(recordCloudSyncError);
+  }, 0);
+}
+
+async function fetchCloudRequest(input, init = {}) {
+  const controller = new AbortController();
+  const originalSignal = init.signal || input?.signal;
+  const abort = () => controller.abort(originalSignal?.reason);
+  if (originalSignal?.aborted) abort();
+  else originalSignal?.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(() => controller.abort(), CLOUD_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+    originalSignal?.removeEventListener("abort", abort);
   }
 }
 
@@ -751,21 +795,24 @@ async function refreshCloudDataIfIdle({ force = false } = {}) {
   if (!cloud.client || !cloud.session || !cloud.ready || cloudRefreshInFlight) return;
   if (document.visibilityState === "hidden") return;
   if (phasePhotoUploadInFlight) return;
-  if (!force && isEditingAppField()) return;
-
   cloudRefreshInFlight = true;
+  updateCloudSyncStatus();
   try {
     const beforeRefresh = snapshotVisibleCloudData();
-    await loadCloudData();
+    // Pending uploads must retry even while a form field remains focused.
     await flushPendingSync();
+    if (isEditingAppField()) return;
+    if (!cloud.historyLoaded) await reconcileAccountHistory();
+    await loadCloudData();
     if (hasAnyPendingSync()) return;
     const afterRefresh = snapshotVisibleCloudData();
     saveLocal();
     if (beforeRefresh !== afterRefresh) render();
   } catch (error) {
-    console.warn(error);
+    recordCloudSyncError(error);
   } finally {
     cloudRefreshInFlight = false;
+    updateCloudSyncStatus();
   }
 }
 
@@ -866,7 +913,8 @@ function normalizeState(value, fallback = createDefaultState()) {
     weeks: value?.weeks && typeof value.weeks === "object" ? value.weeks : fallback.weeks,
     nutrition: value?.nutrition && typeof value.nutrition === "object" ? value.nutrition : fallback.nutrition,
     nutritionPhase: normalizeNutritionPhase(value?.nutritionPhase || findStoredNutritionPhase(value?.nutrition) || fallback.nutritionPhase),
-    library: Array.isArray(value?.library) ? value.library : fallback.library
+    library: Array.isArray(value?.library) ? value.library : fallback.library,
+    libraryUpdatedAt: normalizeIsoTimestamp(value?.libraryUpdatedAt)
   };
 
   next.selectedDay = Math.max(0, Math.min(6, next.selectedDay));
@@ -966,6 +1014,15 @@ function saveWorkoutWeek(weekStart = state.weekStart) {
 }
 
 function saveLocal() {
+  const libraryFingerprint = JSON.stringify(state.library);
+  if (libraryFingerprint !== savedLibraryFingerprint) {
+    state.libraryUpdatedAt = nextPendingTimestamp(state.libraryUpdatedAt);
+    savedLibraryFingerprint = libraryFingerprint;
+    if (activeUserId) {
+      markPendingNutritionSync(NUTRITION_PHASE_WEEK_START);
+      scheduleNutritionSync();
+    }
+  }
   localStorage.setItem(activeStorageKey, JSON.stringify(state));
 }
 
@@ -992,6 +1049,7 @@ function loadPendingSync(storageKey = activePendingSyncKey) {
 
 function savePendingSync() {
   localStorage.setItem(activePendingSyncKey, JSON.stringify(pendingSync));
+  updateCloudSyncStatus();
 }
 
 function userStorageKey(userId) {
@@ -1008,8 +1066,13 @@ function activateUserStorage(userId) {
   activeStorageKey = userStorageKey(userId);
   activePendingSyncKey = userPendingSyncKey(userId);
   cloud.yearConsistency = createEmptyYearConsistencyCache();
+  cloud.hasLoaded = false;
+  cloud.historyLoaded = false;
+  cloud.lastSyncedAt = "";
+  cloud.syncError = "";
   const theme = state?.theme === "light" ? "light" : "dark";
   state = loadState(activeStorageKey, createAccountState(theme));
+  savedLibraryFingerprint = JSON.stringify(state.library);
   pendingSync = loadPendingSync(activePendingSyncKey);
   saveLocal();
 }
@@ -1060,6 +1123,7 @@ function activateAnonymousStorage() {
   activeStorageKey = STORAGE_KEY;
   activePendingSyncKey = PENDING_SYNC_KEY;
   state = loadState(activeStorageKey, createDefaultState());
+  savedLibraryFingerprint = JSON.stringify(state.library);
   pendingSync = loadPendingSync(activePendingSyncKey);
 }
 
@@ -1107,7 +1171,7 @@ function touchWorkoutDay(weekStart = state.weekStart, dayIndex = state.selectedD
 
 function markPendingWorkoutSync(weekStart = state.weekStart, dayIndex = state.selectedDay) {
   const day = state.weeks?.[weekStart]?.[dayIndex];
-  const updatedAt = dayEditedAt(day) || new Date().toISOString();
+  const updatedAt = nextPendingTimestamp(pendingSync.workouts[workoutPendingKey(weekStart, dayIndex)]?.updatedAt, dayEditedAt(day));
   pendingSync.workouts[workoutPendingKey(weekStart, dayIndex)] = {
     weekStart,
     dayIndex: Number(dayIndex),
@@ -1119,7 +1183,7 @@ function markPendingWorkoutSync(weekStart = state.weekStart, dayIndex = state.se
 
 function markPendingWorkoutDeletion(weekStart = state.weekStart, dayIndex = state.selectedDay) {
   const day = state.weeks?.[weekStart]?.[dayIndex];
-  const updatedAt = dayEditedAt(day) || new Date().toISOString();
+  const updatedAt = nextPendingTimestamp(pendingSync.workouts[workoutPendingKey(weekStart, dayIndex)]?.updatedAt, dayEditedAt(day));
   pendingSync.workouts[workoutPendingKey(weekStart, dayIndex)] = {
     weekStart,
     dayIndex: Number(dayIndex),
@@ -1133,9 +1197,13 @@ function markPendingWorkoutDeletion(weekStart = state.weekStart, dayIndex = stat
 function markPendingNutritionSync(weekStart = state.weekStart) {
   pendingSync.nutrition[weekStart] = {
     weekStart,
-    updatedAt: new Date().toISOString()
+    updatedAt: nextPendingTimestamp(pendingSync.nutrition[weekStart]?.updatedAt)
   };
   savePendingSync();
+}
+
+function nextPendingTimestamp(previous, editedAt = "") {
+  return new Date(Math.max(Date.now(), timestampMs(editedAt), timestampMs(previous) + 1)).toISOString();
 }
 
 function touchNutritionPhase(at = new Date().toISOString()) {
@@ -1192,6 +1260,41 @@ function hasPendingNutritionForWeek(weekStart) {
 
 function hasAnyPendingSync() {
   return Boolean(Object.keys(pendingSync.workouts).length || Object.keys(pendingSync.nutrition).length);
+}
+
+function getCloudSyncStatus() {
+  const pendingCount = Object.keys(pendingSync.workouts).length + Object.keys(pendingSync.nutrition).length;
+  if (!cloud.session) return { label: "Local mode", detail: "Přihlas se ke stejnému účtu na všech zařízeních.", ok: false };
+  if (navigator.onLine === false) return { label: "Offline", detail: "Změny jsou uložené v tomto zařízení a odešlou se po připojení.", ok: false };
+  if (cloud.syncError) return { label: "Synchronizace se nepovedla", detail: cloud.syncError, ok: false };
+  if (pendingCount) return { label: "Čeká na synchronizaci", detail: `Počet neodeslaných záznamů: ${pendingCount}.`, ok: false };
+  if (flushingPendingSync || cloudRefreshInFlight || !cloud.hasLoaded || !cloud.historyLoaded) return { label: "Synchronizuji…", detail: "Ověřuji data uložená v cloudu.", ok: false };
+  return { label: "Cloud synced", detail: cloud.lastSyncedAt ? `Poslední synchronizace: ${formatCloudDate(cloud.lastSyncedAt)}.` : "Data jsou uložená v cloudu.", ok: true };
+}
+
+function updateCloudSyncStatus() {
+  const status = getCloudSyncStatus();
+  app.querySelectorAll("[data-cloud-sync-label]").forEach((element) => {
+    element.textContent = localizeInterfaceText(status.label);
+  });
+  app.querySelectorAll("[data-cloud-sync-detail]").forEach((element) => {
+    element.textContent = localizeInterfaceText(status.detail);
+  });
+  app.querySelectorAll("[data-cloud-sync-indicator]").forEach((element) => {
+    element.classList.toggle("offline", !status.ok);
+  });
+  app.querySelectorAll('[data-action="sync-now"]').forEach((element) => {
+    element.disabled = flushingPendingSync || cloudRefreshInFlight;
+  });
+}
+
+function recordCloudSyncError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  cloud.syncError = /jwt|token.*expired|invalid.*token/.test(message)
+    ? "Přihlášení vypršelo. Přihlas se znovu ke stejnému účtu."
+    : "Cloud teď není dostupný. Změny zůstávají uložené v tomto zařízení. Zkus synchronizaci zopakovat.";
+  console.warn(error);
+  updateCloudSyncStatus();
 }
 
 function createDefaultLibrary() {
@@ -2043,6 +2146,7 @@ function renderWeekHeaderMeta(summary, nutrition, nutritionSummary, sleepSummary
 
 function renderCloudBadge() {
   if (cloud.session) {
+    const sync = getCloudSyncStatus();
     return `
       <details class="account-menu">
         <summary class="account-trigger">
@@ -2051,7 +2155,7 @@ function renderCloudBadge() {
           <span class="account-caret" aria-hidden="true"></span>
         </summary>
         <div class="account-popover">
-          <div class="account-status"><span></span> Cloud synced</div>
+          <div class="account-status${sync.ok ? "" : " offline"}" data-cloud-sync-indicator><span></span><strong data-cloud-sync-label>${escapeHtml(sync.label)}</strong></div>
           <button class="account-action" data-action="set-view" data-view="profile">Account settings</button>
           <button class="account-action" data-action="toggle-theme" aria-pressed="${state.theme === "dark"}">${state.theme === "dark" ? "Light appearance" : "Dark appearance"}</button>
           <button class="account-action account-signout" data-action="sign-out">Sign out</button>
@@ -2233,13 +2337,12 @@ function renderPasswordResetShell() {
 function renderProfileShell() {
   const email = cloud.session?.user?.email || "Cloud account";
   const initial = profileName().slice(0, 1).toUpperCase() || "B";
-  const cloudSynced = Boolean(cloud.configured && cloud.session);
-  const cloudState = cloudSynced ? "Cloud synced" : "Local mode";
-  const cloudHeading = cloudSynced ? "Synchronizace aktivní" : "Cloud není připojený";
-  const cloudCopy = cloudSynced
-    ? "Tréninky, nutrition a routine jsou při přihlášení oddělené podle účtu."
-    : "Připoj Supabase a přihlas se, aby se data synchronizovala mezi zařízeními.";
-  const cloudConnection = cloudSynced ? "Supabase connected" : "Supabase offline";
+  const sync = getCloudSyncStatus();
+  const cloudSynced = sync.ok;
+  const cloudState = sync.label;
+  const cloudHeading = "Synchronizace mezi zařízeními";
+  const cloudCopy = "Na počítači i mobilu používej stejnou adresu aplikace a stejný e-mail. Tréninky, výživa, regenerace a progres se ukládají k tvému účtu.";
+  const cloudConnection = sync.label;
   return `
     <main class="profile-shell">
       <section class="profile-hero">
@@ -2249,7 +2352,7 @@ function renderProfileShell() {
           <h2>${escapeHtml(profileName())}</h2>
           <p>${escapeHtml(email)}</p>
         </div>
-        <span class="profile-cloud-state${cloudSynced ? "" : " offline"}"><span></span> ${cloudState}</span>
+        <span class="profile-cloud-state${cloudSynced ? "" : " offline"}" data-cloud-sync-indicator><span></span><strong data-cloud-sync-label>${escapeHtml(cloudState)}</strong></span>
       </section>
       <div class="profile-layout">
         <div class="profile-main-column">
@@ -2276,7 +2379,11 @@ function renderProfileShell() {
               <h3>${cloudHeading}</h3>
               <p>${cloudCopy}</p>
             </div>
-            <div class="profile-sync-line${cloudSynced ? "" : " offline"}"><span></span><strong>${cloudConnection}</strong></div>
+            <div class="profile-sync-line${cloudSynced ? "" : " offline"}" data-cloud-sync-indicator><span></span><strong data-cloud-sync-label>${escapeHtml(cloudConnection)}</strong></div>
+            <p class="auth-copy" data-cloud-sync-detail>${escapeHtml(sync.detail)}</p>
+            <button class="btn primary" type="button" data-action="sync-now"${flushingPendingSync || cloudRefreshInFlight ? " disabled" : ""}>Synchronizovat teď</button>
+            <button class="btn" type="button" data-action="export-data">Záloha dat do souboru</button>
+            <button class="btn" type="button" data-action="import-data">Importovat zálohu</button>
           </section>
           <section class="profile-section danger-zone">
           <div>
@@ -4354,6 +4461,27 @@ async function handleClick(event) {
   if (!target) return;
 
   const action = target.dataset.action;
+  if (action === "sync-now") {
+    if (!cloud.client || !cloud.session) return;
+    if (cloudRefreshInFlight || flushingPendingSync) return;
+    cloudRefreshInFlight = true;
+    updateCloudSyncStatus();
+    try {
+      await reconcileAccountHistory();
+      await flushPendingSync();
+      await loadCloudData();
+      if (state.activeView === "dashboard") await loadYearConsistencyData(getSelectedDate().getFullYear(), { force: true });
+      saveLocal();
+      showToast(!hasAnyPendingSync() && !cloud.syncError && cloud.hasLoaded && cloud.historyLoaded ? "Data jsou synchronizovaná." : getCloudSyncStatus().detail);
+    } catch (error) {
+      recordCloudSyncError(error);
+      showToast("Synchronizace se nepovedla. Data zůstávají uložená v tomto zařízení.");
+    } finally {
+      cloudRefreshInFlight = false;
+      render();
+    }
+    return;
+  }
   const week = ensureWeek();
   const day = week[state.selectedDay];
 
@@ -5141,22 +5269,48 @@ async function signOutUser() {
 
 async function finishSignedInSession(session, toastMessage = "") {
   if (!session) return;
+  if (signedInSessionPromise && signedInSessionUserId === session.user.id) return signedInSessionPromise;
+  signedInSessionUserId = session.user.id;
+  const work = initializeSignedInSession(session, toastMessage);
+  signedInSessionPromise = work;
+  try {
+    return await work;
+  } finally {
+    if (signedInSessionPromise === work) signedInSessionPromise = null;
+  }
+}
+
+async function initializeSignedInSession(session, toastMessage = "") {
+  if (!session) return;
   cloud.session = session;
   activateUserStorage(session.user.id);
   if (!cloud.passwordRecovery) {
     cloud.authNotice = null;
     cloud.pendingEmail = "";
   }
-  await ensureProfile();
+  try {
+    await ensureProfile();
+  } catch (error) {
+    console.warn(error);
+  }
+  if (cloud.session?.user.id !== session.user.id) return;
   if (!cloud.passwordRecovery) {
+    try {
+      await reconcileAccountHistory();
+    } catch (error) {
+      recordCloudSyncError(error);
+    }
     await loadCloudData();
     await flushPendingSync();
+    if (cloud.session?.user.id !== session.user.id) return;
     saveLocal();
+    render();
     if (toastMessage) showToast(toastMessage);
   }
 }
 
 function finishSignedOutState(theme = state.theme) {
+  clearTimeout(authChangeTimer);
   cloud.session = null;
   cloud.profile = null;
   cloud.feed = [];
@@ -5166,6 +5320,10 @@ function finishSignedOutState(theme = state.theme) {
   cloud.authNotice = null;
   cloud.pendingEmail = "";
   cloud.passwordRecovery = false;
+  cloud.hasLoaded = false;
+  cloud.historyLoaded = false;
+  cloud.lastSyncedAt = "";
+  cloud.syncError = "";
   clearPostImageSelection();
   activateAnonymousStorage();
   state.theme = theme;
@@ -5910,10 +6068,11 @@ function handleImport(event) {
   reader.onload = () => {
     try {
       const imported = JSON.parse(String(reader.result));
-      state = normalizeState(imported);
-      save();
+      mergeImportedData(normalizeState(imported));
+      saveLocal();
+      scheduleCloudSync();
       render();
-      showToast("Import hotovy.");
+      showToast("Import hotový. Celá historie čeká na synchronizaci.");
     } catch {
       showToast("Import se nepovedl.");
     } finally {
@@ -5921,6 +6080,35 @@ function handleImport(event) {
     }
   };
   reader.readAsText(file);
+}
+
+function mergeImportedData(imported) {
+  Object.entries(imported.weeks).forEach(([weekStart, week]) => {
+    state.weeks[weekStart] ||= createBlankWeek();
+    DAY_LABELS.forEach((_, dayIndex) => {
+      const source = week[dayIndex];
+      const target = state.weeks[weekStart][dayIndex];
+      if (!hasDayCloudContent(source)) return;
+      if (hasDayCloudContent(target) && dayEditedTime(target) > dayEditedTime(source)) return;
+      state.weeks[weekStart][dayIndex] = source;
+      if (!dayEditedAt(source)) touchWorkoutDay(weekStart, dayIndex);
+      markPendingWorkoutSync(weekStart, dayIndex);
+    });
+  });
+  Object.entries(imported.nutrition).forEach(([weekStart, week]) => {
+    if (!isRealNutritionWeekKey(weekStart) || !hasNutritionWeekContent(week)) return;
+    state.nutrition[weekStart] = state.nutrition[weekStart]
+      ? mergeNutritionWeeks(week, state.nutrition[weekStart], { preferUntimed: "local" }) : week;
+    markPendingNutritionSync(weekStart);
+  });
+  state.nutritionPhase = mergePhasePhotos(state.nutritionPhase, imported.nutritionPhase);
+  if (hasNutritionPhaseData(state.nutritionPhase)) markPendingNutritionSync(NUTRITION_PHASE_WEEK_START);
+  const existing = new Set(state.library.map((item) => item.name.trim().toLowerCase()));
+  imported.library.forEach((item) => {
+    if (existing.has(item.name.trim().toLowerCase())) return;
+    state.library.push(item);
+    existing.add(item.name.trim().toLowerCase());
+  });
 }
 
 async function handlePhasePhotoImport(event) {
@@ -6252,9 +6440,116 @@ async function ensureProfile() {
 }
 
 async function loadCloudData() {
-  await loadCloudWeek();
-  await loadCloudNutritionWeek();
-  await loadSocialData();
+  const userId = cloud.session?.user.id;
+  if (!userId) return false;
+  try {
+    await loadCloudWeek();
+    await loadCloudNutritionWeek();
+    await loadSocialData();
+    if (cloud.session?.user.id !== userId) return false;
+    cloud.hasLoaded = true;
+    if (!hasAnyPendingSync()) {
+      cloud.syncError = "";
+      cloud.lastSyncedAt = new Date().toISOString();
+    }
+    return true;
+  } catch (error) {
+    if (cloud.session?.user.id === userId) recordCloudSyncError(error);
+    return false;
+  } finally {
+    updateCloudSyncStatus();
+  }
+}
+
+async function fetchAccountRows(table, columns, userId) {
+  const rows = [];
+  for (let offset = 0; ; offset += 500) {
+    const { data, error } = await cloud.client.from(table).select(columns)
+      .eq("user_id", userId).order("week_start", { ascending: true })
+      .order("id", { ascending: true }).range(offset, offset + 499);
+    if (error) throw error;
+    rows.push(...(data || []));
+    if (!data || data.length < 500) return rows;
+  }
+}
+
+async function reconcileAccountHistory() {
+  const userId = cloud.session?.user.id;
+  if (!userId) return;
+  const [workouts, nutrition] = await Promise.all([
+    fetchAccountRows("workout_days", "*", userId),
+    fetchAccountRows("nutrition_weeks", "week_start,payload,updated_at,id", userId)
+  ]);
+  if (cloud.session?.user.id !== userId) return;
+  const workoutRows = new Map(workouts.map((row) => [workoutPendingKey(row.week_start, row.day_index), row]));
+  const weekStarts = new Set([...Object.keys(state.weeks), ...workouts.map((row) => row.week_start)]);
+  for (const weekStart of weekStarts) {
+    const localWeek = state.weeks[weekStart] || createBlankWeek();
+    const merged = createBlankWeek();
+    DAY_LABELS.forEach((_, dayIndex) => {
+      const key = workoutPendingKey(weekStart, dayIndex);
+      const row = workoutRows.get(key);
+      const localDay = localWeek[dayIndex];
+      const cloudDay = row ? rowToDay(row) : merged[dayIndex];
+      const pending = pendingSync.workouts[key];
+      const localTime = dayEditedTime(localDay);
+      const cloudTime = dayEditedTime(cloudDay);
+      const keepLocal = pending?.deleted
+        ? (!row || localTime >= cloudTime)
+        : pending ? shouldKeepLocalWorkout(localDay, cloudDay, pending, row)
+          : hasDayCloudContent(localDay) && localTime && (!row || localTime > cloudTime);
+      merged[dayIndex] = keepLocal ? localDay : cloudDay;
+      if (keepLocal && !pending) {
+        state.weeks[weekStart] = localWeek;
+        markPendingWorkoutSync(weekStart, dayIndex);
+      } else if (!keepLocal && pending) clearPendingWorkoutSync(weekStart, dayIndex);
+    });
+    state.weeks[weekStart] = merged;
+  }
+  const nutritionRows = new Map(nutrition.map((row) => [row.week_start, row]));
+  for (const weekStart of new Set([...Object.keys(state.nutrition), ...nutritionRows.keys()])) {
+    if (!isRealNutritionWeekKey(weekStart)) continue;
+    const row = nutritionRows.get(weekStart);
+    const localWeek = state.nutrition[weekStart];
+    const cloudWeek = row ? normalizeNutritionWeek(row.payload) : null;
+    const merged = localWeek && cloudWeek ? mergeNutritionWeeks(localWeek, cloudWeek) : localWeek || cloudWeek;
+    if (!merged) continue;
+    state.nutrition[weekStart] = merged;
+    if (hasNutritionWeekContent(merged) && (!cloudWeek || !nutritionWeeksEqual(merged, cloudWeek))) {
+      if (!hasPendingNutritionForWeek(weekStart)) markPendingNutritionSync(weekStart);
+    }
+  }
+  const phaseRow = nutritionRows.get(NUTRITION_PHASE_WEEK_START);
+  mergeCloudLibrary(phaseRow?.payload?.library);
+  const remotePhase = normalizeNutritionPhase(phaseRow?.payload?.phase);
+  state.nutritionPhase = mergePhasePhotos(remotePhase, state.nutritionPhase);
+  if (!phaseRow?.payload?.library || (hasNutritionPhaseData(state.nutritionPhase) && (!phaseRow || JSON.stringify(stripPhasePhotosForCloud(state.nutritionPhase)) !== JSON.stringify(stripPhasePhotosForCloud(remotePhase))))) {
+    if (!hasPendingNutritionForWeek(NUTRITION_PHASE_WEEK_START)) markPendingNutritionSync(NUTRITION_PHASE_WEEK_START);
+  }
+  saveLocal();
+  cloud.historyLoaded = true;
+}
+
+function mergeCloudLibrary(library) {
+  if (!Array.isArray(library?.items)) return;
+  const cloudTime = timestampMs(library.updatedAt);
+  if (timestampMs(state.libraryUpdatedAt) > cloudTime) {
+    if (!hasPendingNutritionForWeek(NUTRITION_PHASE_WEEK_START)) markPendingNutritionSync(NUTRITION_PHASE_WEEK_START);
+    return;
+  }
+  if (cloudTime && cloudTime >= timestampMs(state.libraryUpdatedAt)) {
+    // An untimed legacy custom library is preserved when first migrating.
+    const legacyItems = !state.libraryUpdatedAt ? state.library.filter((item) => !createDefaultLibrary().some((defaultItem) => defaultItem.name === item.name)) : [];
+    const normalized = normalizeState({ library: library.items }).library;
+    const names = new Set(normalized.map((item) => item.name.trim().toLowerCase()));
+    legacyItems.forEach((item) => {
+      if (!names.has(item.name.trim().toLowerCase())) normalized.push(item);
+    });
+    state.library = normalized;
+    state.libraryUpdatedAt = normalized.length === library.items.length ? normalizeIsoTimestamp(library.updatedAt) : new Date().toISOString();
+    savedLibraryFingerprint = JSON.stringify(state.library);
+    if (normalized.length !== library.items.length) markPendingNutritionSync(NUTRITION_PHASE_WEEK_START);
+  }
 }
 
 function createEmptyYearConsistencyCache() {
@@ -6309,36 +6604,29 @@ async function loadYearConsistencyData(year, { force = false } = {}) {
 
 async function loadCloudWeek() {
   if (!cloud.client || !cloud.session) return;
+  const userId = cloud.session.user.id;
+  const weekStart = state.weekStart;
   cloud.loading = true;
   const { data, error } = await cloud.client
     .from("workout_days")
     .select("*")
-    .eq("user_id", cloud.session.user.id)
-    .eq("week_start", state.weekStart)
+    .eq("user_id", userId)
+    .eq("week_start", weekStart)
     .order("day_index", { ascending: true });
 
   cloud.loading = false;
+  if (cloud.session?.user.id !== userId) return;
   if (error) {
-    cloud.message = error.message;
-    showToast("Cloud tyden se nepodarilo nacist.");
-    return;
-  }
-
-  if (!data?.length) {
-    if (hasPendingWorkoutsForWeek(state.weekStart)) {
-      await flushPendingSync();
-    } else if (!hasPendingWorkoutsForWeek(state.weekStart)) {
-      state.weeks[state.weekStart] = createBlankWeek();
-    }
-    return;
+    recordCloudSyncError(error);
+    throw error;
   }
   const week = createBlankWeek();
-  data.forEach((row) => {
+  (data || []).forEach((row) => {
     week[row.day_index] = rowToDay(row);
   });
-  const rowsByDay = new Map(data.map((row) => [Number(row.day_index), row]));
-  state.weeks[state.weekStart] = mergeCloudWeekWithPendingLocal(state.weekStart, week, rowsByDay);
-  data
+  const rowsByDay = new Map((data || []).map((row) => [Number(row.day_index), row]));
+  state.weeks[weekStart] = mergeCloudWeekWithPendingLocal(weekStart, week, rowsByDay);
+  (data || [])
     .filter((row) => row.visibility === "friends")
     .forEach((row) => markPendingWorkoutSync(row.week_start, row.day_index));
   await flushPendingSync();
@@ -6355,6 +6643,7 @@ function mergeCloudWeekWithPendingLocal(weekStart, cloudWeek, cloudRowsByDay = n
     const cloudRow = cloudRowsByDay.get(dayIndex) || null;
     const localShouldWin = shouldKeepLocalWorkout(localDay, cloudDay, pending, cloudRow);
     mergedWeek[dayIndex] = localShouldWin ? localDay : cloudDay;
+    if (localShouldWin && !pending && hasDayCloudContent(localDay)) markPendingWorkoutSync(weekStart, dayIndex);
     if (!localShouldWin && pending) {
       clearPendingWorkoutSync(weekStart, dayIndex);
     }
@@ -6363,16 +6652,17 @@ function mergeCloudWeekWithPendingLocal(weekStart, cloudWeek, cloudRowsByDay = n
 }
 
 function shouldKeepLocalWorkout(localDay, cloudDay, pending = null, cloudRow = null) {
-  if (pending?.deleted) return true;
+  if (pending?.deleted) return !cloudRow || dayEditedTime(localDay) >= dayEditedTime(cloudDay);
+  if (cloudRow?.payload?.deleted) return dayEditedTime(localDay) > dayEditedTime(cloudDay);
   const localStats = workoutContentStats(localDay);
   const cloudStats = workoutContentStats(cloudDay);
   if (!localStats.hasContent) return Boolean(pending?.fingerprint && !cloudStats.hasContent);
-  if (!pending?.fingerprint) return false;
+  if (!pending?.fingerprint) return Boolean(dayEditedTime(localDay) && (!cloudRow || dayEditedTime(localDay) > dayEditedTime(cloudDay)));
   if (!cloudStats.hasContent) return true;
 
   const localTime = dayEditedTime(localDay) || pendingEditedTime(pending);
   const cloudTime = dayEditedTime(cloudDay) || cloudRowEditedTime(cloudRow);
-  if (localTime && cloudTime) return localTime >= cloudTime - 1000;
+  if (localTime && cloudTime) return localTime >= cloudTime;
   if (localTime && !cloudTime) return true;
   return false;
 }
@@ -6398,45 +6688,48 @@ async function loadCloudWeekByStart(weekStart) {
 
 async function loadCloudNutritionWeek() {
   if (!cloud.client || !cloud.session) return;
-  if (!flushingPendingSync && hasPendingNutritionForWeek(state.weekStart)) {
+  const userId = cloud.session.user.id;
+  const weekStart = state.weekStart;
+  if (!flushingPendingSync && hasPendingNutritionForWeek(weekStart)) {
     await flushPendingSync();
-    if (hasPendingNutritionForWeek(state.weekStart)) return;
+    if (hasPendingNutritionForWeek(weekStart)) return;
   }
   const { data, error } = await cloud.client
     .from("nutrition_weeks")
     .select("*")
-    .eq("user_id", cloud.session.user.id)
-    .eq("week_start", state.weekStart)
+    .eq("user_id", userId)
+    .eq("week_start", weekStart)
     .maybeSingle();
 
+  if (cloud.session?.user.id !== userId) return;
   if (error) {
     console.warn(error);
     showCloudError("Nutrition data se nepodarilo nacist.", error);
-    return;
+    throw error;
   }
 
   if (!data) {
-    const localNutrition = ensureNutritionWeek();
-    if (hasNutritionWeekContent(localNutrition)) await saveNutritionToCloud();
+    const localNutrition = state.nutrition[weekStart] || createNutritionWeek();
+    if (hasNutritionWeekContent(localNutrition)) await saveNutritionWeekToCloud(weekStart);
     await loadCloudNutritionPhase();
     await loadCloudPhasePhotos();
     await syncLocalPhasePhotosToCloud();
     return;
   }
   const cloudNutrition = normalizeNutritionWeek(data.payload);
-  const localNutrition = state.nutrition[state.weekStart]
-    ? normalizeNutritionWeek(state.nutrition[state.weekStart])
+  const localNutrition = state.nutrition[weekStart]
+    ? normalizeNutritionWeek(state.nutrition[weekStart])
     : null;
   const mergedNutrition = localNutrition
     ? mergeNutritionWeeks(localNutrition, cloudNutrition, { preferUntimed: "cloud" })
     : cloudNutrition;
-  state.nutrition[state.weekStart] = mergedNutrition;
+  state.nutrition[weekStart] = mergedNutrition;
   if (
     localNutrition &&
     !nutritionWeeksEqual(mergedNutrition, cloudNutrition) &&
     hasNutritionWeekContent(mergedNutrition)
   ) {
-    markPendingNutritionSync(state.weekStart);
+    markPendingNutritionSync(weekStart);
     await flushPendingSync();
   }
   await loadCloudNutritionPhase();
@@ -6446,6 +6739,7 @@ async function loadCloudNutritionWeek() {
 
 async function loadCloudNutritionPhase(fallbackPhase = null) {
   if (!cloud.client || !cloud.session) return;
+  const userId = cloud.session.user.id;
   if (!flushingPendingSync && hasPendingNutritionForWeek(NUTRITION_PHASE_WEEK_START)) {
     await flushPendingSync();
     if (hasPendingNutritionForWeek(NUTRITION_PHASE_WEEK_START)) return;
@@ -6453,19 +6747,21 @@ async function loadCloudNutritionPhase(fallbackPhase = null) {
   const { data, error } = await cloud.client
     .from("nutrition_weeks")
     .select("payload")
-    .eq("user_id", cloud.session.user.id)
+    .eq("user_id", userId)
     .eq("week_start", NUTRITION_PHASE_WEEK_START)
     .maybeSingle();
 
+  if (cloud.session?.user.id !== userId) return;
   if (error) {
     console.warn(error);
     if (fallbackPhase) {
       state.nutritionPhase = mergePhasePhotos(normalizeNutritionPhase(fallbackPhase), state.nutritionPhase);
     }
-    return;
+    throw error;
   }
 
   const phase = data?.payload?.phase || fallbackPhase;
+  mergeCloudLibrary(data?.payload?.library);
   if (phase) {
     state.nutritionPhase = mergePhasePhotos(normalizeNutritionPhase(phase), state.nutritionPhase);
   }
@@ -6476,16 +6772,15 @@ async function loadCloudNutritionPhase(fallbackPhase = null) {
 
 async function loadCloudPhasePhotos() {
   if (!cloud.client || !cloud.session) return;
+  const userId = cloud.session.user.id;
   const { data, error } = await cloud.client
     .from("progress_photos")
     .select("id,user_id,phase_row_id,week_label,storage_path,file_name,width,height,file_size,created_at")
-    .eq("user_id", cloud.session.user.id)
+    .eq("user_id", userId)
     .order("created_at", { ascending: true });
 
-  if (error) {
-    if (error.code !== "42P01") console.warn(error);
-    return;
-  }
+  if (cloud.session?.user.id !== userId) return;
+  if (error) throw error;
 
   const photos = await Promise.all((data || []).map(async (record) => {
     const { data: signed, error: signedError } = await cloud.client
@@ -6499,7 +6794,7 @@ async function loadCloudPhasePhotos() {
     return cloudPhasePhotoFromRow(record, signed?.signedUrl || "");
   }));
 
-  attachCloudPhasePhotos(photos.filter(Boolean));
+  if (cloud.session?.user.id === userId) attachCloudPhasePhotos(photos.filter(Boolean));
 }
 
 function attachCloudPhasePhotos(photos) {
@@ -7063,7 +7358,7 @@ function scheduleCloudSync() {
 }
 
 function scheduleNutritionSync() {
-  if (!cloud.client || !cloud.session || !["nutrition", "sleep"].includes(state.activeView)) return;
+  if (!cloud.client || !cloud.session) return;
   clearTimeout(nutritionSyncTimer);
   nutritionSyncTimer = setTimeout(() => {
     runPendingSyncNow("Nutrition cloud ulozeni se nepovedlo.");
@@ -7083,29 +7378,45 @@ function runPendingSyncNow(errorPrefix) {
 }
 
 async function flushPendingSync() {
-  if (flushingPendingSync || !cloud.client || !cloud.session) return;
+  if (pendingSyncPromise) return pendingSyncPromise;
+  if (!cloud.client || !cloud.session || !hasAnyPendingSync()) return;
+  const work = uploadPendingSync();
+  pendingSyncPromise = work;
+  try {
+    return await work;
+  } finally {
+    if (pendingSyncPromise === work) pendingSyncPromise = null;
+    flushingPendingSync = false;
+    updateCloudSyncStatus();
+  }
+}
 
+async function uploadPendingSync() {
+  const userId = cloud.session.user.id;
   const workoutItems = Object.values(pendingSync.workouts);
   const nutritionItems = Object.values(pendingSync.nutrition);
-  if (!workoutItems.length && !nutritionItems.length) return;
-
   flushingPendingSync = true;
-  let hadError = false;
-  try {
-    for (const item of workoutItems) {
-      await saveDayToCloud(item.weekStart, Number(item.dayIndex), item.updatedAt);
+  updateCloudSyncStatus();
+  let firstError = null;
+  for (const [kind, items] of [["workouts", workoutItems], ["nutrition", nutritionItems]]) {
+    for (const item of items) {
+      if (cloud.session?.user.id !== userId) return;
+      try {
+        if (kind === "workouts") await saveDayToCloud(item.weekStart, Number(item.dayIndex), item.updatedAt);
+        else await saveNutritionWeekToCloud(item.weekStart, item.updatedAt);
+      } catch (error) {
+        firstError ||= error;
+      }
     }
-    for (const item of nutritionItems) {
-      await saveNutritionWeekToCloud(item.weekStart, item.updatedAt);
-    }
-  } catch (error) {
-    hadError = true;
-    console.warn(error);
-    showCloudError("Neulozene zmeny se nepodarilo dosynchronizovat.", error);
-  } finally {
-    flushingPendingSync = false;
-    if (!hadError && hasAnyPendingSync()) scheduleCloudSync();
   }
+  if (cloud.session?.user.id !== userId) return;
+  if (firstError) recordCloudSyncError(firstError);
+  else {
+    cloud.syncError = "";
+    cloud.lastSyncedAt = new Date().toISOString();
+    if (hasAnyPendingSync()) scheduleCloudSync();
+  }
+  return !firstError;
 }
 
 async function saveSelectedDayToCloud() {
@@ -7116,17 +7427,15 @@ async function saveSelectedDayToCloud() {
 
 async function saveDayToCloud(weekStart, dayIndex, expectedPendingUpdatedAt = null) {
   if (!cloud.client || !cloud.session) return;
+  const userId = cloud.session.user.id;
   const pendingKey = workoutPendingKey(weekStart, dayIndex);
-  const pending = expectedPendingUpdatedAt ? pendingSync.workouts[pendingKey] || null : null;
-  const day = state.weeks[weekStart]?.[dayIndex];
-  if (pending?.deleted) {
-    await deleteDayFromCloud(weekStart, dayIndex);
-    clearPendingWorkoutSyncIfCurrent(weekStart, dayIndex, expectedPendingUpdatedAt);
-    saveLocal();
-    return;
-  }
+  let pending = expectedPendingUpdatedAt ? pendingSync.workouts[pendingKey] || null : null;
+  let day = state.weeks[weekStart]?.[dayIndex];
   if (expectedPendingUpdatedAt) {
     const existing = await fetchExistingWorkoutDay(weekStart, dayIndex);
+    if (cloud.session?.user.id !== userId) return;
+    day = state.weeks[weekStart]?.[dayIndex];
+    pending = pendingSync.workouts[pendingKey] || null;
     if (
       existing &&
       shouldUseCloudWorkoutOverLocal(day, existing, pending, expectedPendingUpdatedAt)
@@ -7140,6 +7449,13 @@ async function saveDayToCloud(weekStart, dayIndex, expectedPendingUpdatedAt = nu
     }
   }
 
+  if (pending?.deleted) {
+    await deleteDayFromCloud(weekStart, dayIndex, dayEditedAt(day));
+    if (cloud.session?.user.id !== userId) return;
+    clearPendingWorkoutSyncIfCurrent(weekStart, dayIndex, expectedPendingUpdatedAt);
+    saveLocal();
+    return;
+  }
   if (!day) {
     clearPendingWorkoutSyncIfCurrent(weekStart, dayIndex, expectedPendingUpdatedAt);
     return;
@@ -7147,6 +7463,7 @@ async function saveDayToCloud(weekStart, dayIndex, expectedPendingUpdatedAt = nu
   const summary = summarizeDay(day);
   if (!hasDayCloudContent(day)) {
     await deleteDayFromCloud(weekStart, dayIndex);
+    if (cloud.session?.user.id !== userId) return;
     clearPendingWorkoutSyncIfCurrent(weekStart, dayIndex, expectedPendingUpdatedAt);
     return;
   }
@@ -7162,7 +7479,7 @@ async function saveDayToCloud(weekStart, dayIndex, expectedPendingUpdatedAt = nu
   const { data, error } = await cloud.client
     .from("workout_days")
     .upsert({
-      user_id: cloud.session.user.id,
+      user_id: userId,
       week_start: weekStart,
       day_index: Number(dayIndex),
       title: day.title || "",
@@ -7179,6 +7496,7 @@ async function saveDayToCloud(weekStart, dayIndex, expectedPendingUpdatedAt = nu
     .single();
 
   if (error) throw error;
+  if (cloud.session?.user.id !== userId) return;
   updateFeedCacheRow(data);
   clearPendingWorkoutSyncIfCurrent(weekStart, dayIndex, expectedPendingUpdatedAt);
   saveLocal();
@@ -7196,23 +7514,24 @@ async function fetchExistingWorkoutDay(weekStart, dayIndex) {
   return data || null;
 }
 
-function isCloudRowNewer(cloudUpdatedAt, localPendingUpdatedAt) {
-  const cloudTime = new Date(cloudUpdatedAt || 0).getTime();
-  const localTime = new Date(localPendingUpdatedAt || 0).getTime();
-  if (!cloudTime || !localTime) return false;
-  return cloudTime > localTime + 1000;
-}
-
-async function deleteDayFromCloud(weekStart, dayIndex) {
+async function deleteDayFromCloud(weekStart, dayIndex, deletedAt = "") {
   if (!cloud.client || !cloud.session) return;
+  const userId = cloud.session.user.id;
+  const editedAt = deletedAt || dayEditedAt(state.weeks[weekStart]?.[dayIndex]) || new Date().toISOString();
+  // Retain the deletion timestamp so an older offline device cannot resurrect it.
   const { error } = await cloud.client
     .from("workout_days")
-    .delete()
-    .eq("user_id", cloud.session.user.id)
-    .eq("week_start", weekStart)
-    .eq("day_index", Number(dayIndex));
+    .upsert({
+      user_id: userId,
+      week_start: weekStart,
+      day_index: Number(dayIndex),
+      title: "", focus: "", notes: "", visibility: "private",
+      payload: { exercises: [], lastEditedAt: editedAt, deleted: true },
+      volume: 0, completed_sets: 0, total_sets: 0,
+      updated_at: new Date().toISOString()
+    }, { onConflict: "user_id,week_start,day_index" });
   if (error) throw error;
-  removeFeedCacheRow(cloud.session.user.id, weekStart, dayIndex);
+  if (cloud.session?.user.id === userId) removeFeedCacheRow(userId, weekStart, dayIndex);
 }
 
 function updateFeedCacheRow(row) {
@@ -7375,16 +7694,16 @@ function workoutDayFingerprint(day) {
 }
 
 function shouldUseCloudWorkoutOverLocal(localDay, cloudRow, pending = null, expectedPendingUpdatedAt = "") {
-  if (pending?.deleted) return false;
+  const localTime = dayEditedTime(localDay) || timestampMs(expectedPendingUpdatedAt) || pendingEditedTime(pending);
+  const cloudTime = cloudRowEditedTime(cloudRow);
+  if (pending?.deleted || cloudRow.payload?.deleted) return cloudTime > localTime;
   const localStats = workoutContentStats(localDay);
   const cloudDay = rowToDay(cloudRow);
   const cloudStats = workoutContentStats(cloudDay);
   if (!localStats.hasContent) return !pending?.fingerprint;
   if (!cloudStats.hasContent) return false;
 
-  const localTime = dayEditedTime(localDay) || timestampMs(expectedPendingUpdatedAt) || pendingEditedTime(pending);
-  const cloudTime = dayEditedTime(cloudDay) || cloudRowEditedTime(cloudRow);
-  if (localTime && cloudTime) return cloudTime > localTime + 1000;
+  if (localTime && cloudTime) return cloudTime > localTime;
   if (localTime && !cloudTime) return false;
   if (!pending?.fingerprint) return true;
   return false;
@@ -7396,40 +7715,16 @@ async function saveNutritionToCloud() {
 
 async function saveNutritionWeekToCloud(weekStart, expectedPendingUpdatedAt = null) {
   if (!cloud.client || !cloud.session) return;
+  const userId = cloud.session.user.id;
   const existing = await fetchExistingNutritionWeek(weekStart);
-  if (expectedPendingUpdatedAt) {
-    if (existing && isCloudRowNewer(existing.updated_at, expectedPendingUpdatedAt)) {
-      if (weekStart === NUTRITION_PHASE_WEEK_START) {
-        const cloudPhase = normalizeNutritionPhase(existing.payload?.phase);
-        const mergedPhase = mergePhasePhotos(state.nutritionPhase, cloudPhase);
-        state.nutritionPhase = mergedPhase;
-        const mergedPayload = JSON.stringify(stripPhasePhotosForCloud(mergedPhase));
-        const cloudPayload = JSON.stringify(stripPhasePhotosForCloud(cloudPhase));
-        if (mergedPayload === cloudPayload) {
-          clearPendingNutritionSyncIfCurrent(weekStart, expectedPendingUpdatedAt);
-          saveLocal();
-          return;
-        }
-      } else {
-        const cloudNutrition = normalizeNutritionWeek(existing.payload);
-        const localNutrition = state.nutrition[weekStart]
-          ? normalizeNutritionWeek(state.nutrition[weekStart])
-          : createNutritionWeek();
-        const mergedNutrition = mergeNutritionWeeks(localNutrition, cloudNutrition, { preferUntimed: "cloud" });
-        state.nutrition[weekStart] = mergedNutrition;
-        if (nutritionWeeksEqual(mergedNutrition, cloudNutrition)) {
-          clearPendingNutritionSyncIfCurrent(weekStart, expectedPendingUpdatedAt);
-          saveLocal();
-          return;
-        }
-      }
-      saveLocal();
-    }
-  }
-
+  if (cloud.session?.user.id !== userId) return;
   if (weekStart === NUTRITION_PHASE_WEEK_START) {
+    if (existing?.payload?.phase) state.nutritionPhase = mergePhasePhotos(state.nutritionPhase, existing.payload.phase);
+    mergeCloudLibrary(existing?.payload?.library);
     await saveNutritionPhaseToCloud();
+    if (cloud.session?.user.id !== userId) return;
     clearPendingNutritionSyncIfCurrent(weekStart, expectedPendingUpdatedAt);
+    saveLocal();
     return;
   }
   const nutrition = state.nutrition[weekStart];
@@ -7445,11 +7740,16 @@ async function saveNutritionWeekToCloud(weekStart, expectedPendingUpdatedAt = nu
     clearPendingNutritionSyncIfCurrent(weekStart, expectedPendingUpdatedAt);
     return;
   }
+  if (existing && nutritionWeeksEqual(mergedNutrition, existing.payload)) {
+    clearPendingNutritionSyncIfCurrent(weekStart, expectedPendingUpdatedAt);
+    saveLocal();
+    return;
+  }
   const summary = summarizeNutrition(mergedNutrition);
   const { error } = await cloud.client
     .from("nutrition_weeks")
     .upsert({
-      user_id: cloud.session.user.id,
+      user_id: userId,
       week_start: weekStart,
       payload: normalizeNutritionWeek(mergedNutrition),
       calories: summary.totalCalories,
@@ -7461,7 +7761,9 @@ async function saveNutritionWeekToCloud(weekStart, expectedPendingUpdatedAt = nu
     }, { onConflict: "user_id,week_start" });
 
   if (error) throw error;
+  if (cloud.session?.user.id !== userId) return;
   clearPendingNutritionSyncIfCurrent(weekStart, expectedPendingUpdatedAt);
+  saveLocal();
 }
 
 async function fetchExistingNutritionWeek(weekStart) {
@@ -7477,13 +7779,15 @@ async function fetchExistingNutritionWeek(weekStart) {
 
 async function saveNutritionPhaseToCloud() {
   if (!cloud.client || !cloud.session) return;
+  state.libraryUpdatedAt ||= new Date().toISOString();
   const { error } = await cloud.client
     .from("nutrition_weeks")
     .upsert({
       user_id: cloud.session.user.id,
       week_start: NUTRITION_PHASE_WEEK_START,
       payload: {
-        phase: stripPhasePhotosForCloud(state.nutritionPhase)
+        phase: stripPhasePhotosForCloud(state.nutritionPhase),
+        library: { items: state.library, updatedAt: state.libraryUpdatedAt }
       },
       calories: 0,
       protein: 0,
